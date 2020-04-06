@@ -1,0 +1,808 @@
+---
+title: Single-Cell RNA Sequencing Distinguishes Heterogenous Transcriptional Signatures
+  in Macrophages during Efferocytosis
+author: "Connor Lantz, Behram Radmanesh, Esther Liu, Edward B. Thorp, Jennie Lin"
+date: Northwestern University, Feinberg School of Medicine, Departments of Pathology and Medicine and the Feinberg Cardiovascular and Renal Research Institute, Jesse Brown Veterans Affairs Medical Center, Chicago IL, 60611
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+```{r include = FALSE}
+library(pkgbuild)
+library(ggplot2)
+library(dplyr)
+library(Matrix)
+library(sctransform)
+library(cowplot)
+library(monocle)
+library(Seurat)
+library(umap)
+library(RCurl)
+library(scales)
+library(tidyverse)
+library(MAST)
+library(RColorBrewer)
+library(destiny)
+library(SingleCellExperiment)
+library(ggbeeswarm)
+library(ggthemes)
+library(slingshot)
+library(clusterExperiment)
+library(gam)
+library(scater)
+library(gridExtra)
+library(GOplot)
+```
+
+```{r include=FALSE}
+setwd("C:/Users/conno/Documents/Driskill Graduate Program/Projects/Efferocytosis Containaminating RNA/scRNAseq/MANUSCRIPT_scRNAseq")
+```
+# Abstract
+Efferocytosis triggers cellular reprogramming, including transcripts that encode anti-inflammatory cytokines that promote inflammation resolution. Our current understanding of this transcriptional response is largely informed from analysis of bulk phagocyte populations. This precludes the resolution of heterogeneity between individual macrophages and macrophage population subsets. Moreover, phagocytes may be contaminated by passenger transcripts that originate from engulfed apoptotic bodies. To define the transcriptional diversity of efferocytosis, we utilized single cell mRNA sequencing after co-cultivation with apoptotic cells. Importantly, transcriptomic analysis was performed after validating degradation of apoptotic cell-derived transcripts. Our findings reveal heterogeneity of the efferocytic response at single-cell resolution, particularly evident between F4/80+ MHCIILO and F4/80- MHCIIHI macrophage sub-populations. F4/80+ MHCIILO macrophages induced pathways associated with tissue homeostasis and response to oxidative stress, while the F4/80- MHCIIHI subset downregulated these pathways. Ablation of a canonical efferocytosis receptor, MerTK, blunted efferocytic signatures, and led to elevation of apoptotic pathways in F4/80+ MHCIILO macrophages after challenge with apoptotic cells, thereby offering a validation of our approach. Our results highlight the utility of single-cell transcriptomics to study heterogenous transcriptional responses in macrophage subpopulations after exposure to apoptotic cells. 
+
+# Removing Low-quality Cells and Integrating Single Cell Datasets
+## Create Seurat Objects
+
+For each condition's dataset, a Seurat Object is created by reading the corresponding 10X dataset. Low quality cells with less than 100 features are excluded from each Seurat object.
+
+```{r Create Seurat Objects}
+for (file in c("WT_Ctrl", "WT_2_hr", "WT_6_hr", "MerKD_Ctrl", "MerKD_2hr", "MerKD_6_hr")){
+  seurat_data <- Read10X(data.dir = paste0("Data/", file))
+  seurat_obj <- CreateSeuratObject(counts = seurat_data, min.features = 100, project = file)
+  assign(file, seurat_obj)
+}
+```
+
+Each Seurat Object will now be merged to create a single Seurat Object which will be utlilized for quality control analyses.
+```{r}
+#Merge Seurat Object for QC
+merged_seurat <- merge(x = WT_Ctrl, y = c(WT_2_hr, WT_6_hr, MerKD_Ctrl, MerKD_2hr, MerKD_6_hr), add.cell.ids = c("WT_Ctrl", "WT_2_hr", "WT_6_hr", "MerKD_Ctrl", "MerKD_2hr", "MerKD_6_hr"))
+
+merged_seurat
+```
+
+## Quality Control 
+```{r Create Metadata}
+#Log Normalization of Merged Seurat
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+
+#Mitochondrial Feature Expression Ratio
+merged_seurat$mitoRatio <- PercentageFeatureSet(merged_seurat, pattern = "^mt-")
+merged_seurat$mitoRatio <- merged_seurat@meta.data$mitoRatio / 100
+
+#Ribosomal Feature Expression Ratio
+merged_seurat$riboRatio <- PercentageFeatureSet(merged_seurat, pattern = "^Rp[ls]")
+merged_seurat$riboRatio <- merged_seurat@meta.data$riboRatio / 100
+
+#Create Metadata Slot in Merged Seurat
+metadata <- merged_seurat@meta.data
+metadata$cells <- rownames(metadata)
+metadata <- metadata %>%
+  dplyr::rename(seq_folder = orig.ident,
+                nUMI = nCount_RNA,
+                nGene = nFeature_RNA)
+
+#Add Identification Metadata for Each Condition
+metadata$sample <- NA
+metadata$sample[which(str_detect(metadata$cells, "^WT_Ctrl"))] <- "WT_Ctrl"
+metadata$sample[which(str_detect(metadata$cells, "^WT_2_hr"))] <- "WT_2_hr"
+metadata$sample[which(str_detect(metadata$cells, "^WT_6_hr"))] <- "WT_6_hr"
+metadata$sample[which(str_detect(metadata$cells, "^MerKD_Ctrl"))] <- "MerKD_Ctrl"
+metadata$sample[which(str_detect(metadata$cells, "^MerKD_2hr"))] <- "MerKD_2hr"
+metadata$sample[which(str_detect(metadata$cells, "^MerKD_6_hr"))] <- "MerKD_6_hr"
+merged_seurat@meta.data <- metadata
+```
+
+Different quality control metrics such as the number of UMIs, genes, mitochondrial, and ribosomal counts are analyzed to determine the quality of the data. The results from these different quality control metrics will be used to filter out low-quality cells.
+
+```{r Quality Control Metrics, echo=TRUE, warning=FALSE}
+#nCells
+p1 <- metadata %>% 
+  ggplot(aes(x=sample, fill=sample)) + 
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("nCells")
+
+#nUMIs
+p2 <- metadata %>% 
+  ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 1000) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("nUMIS")
+
+#nGenes 
+p3 <- metadata %>% 
+  ggplot(aes(x=sample, y=log10(nGene), fill=sample)) + 
+  geom_boxplot() + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("nGenes")
+
+#mito counts ratio
+p4 <- metadata %>% 
+  ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  geom_density(alpha = 0.1) + 
+  scale_x_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 0.1) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("Mito Ratio")
+
+#ribo counts ratio
+p5 <- metadata %>% 
+  ggplot(aes(color=sample, x=riboRatio, fill=sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("Ribo Ratio")
+
+#novelty gene
+p6 <- metadata %>%
+  ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("Unique genes per UMI")
+
+grid.arrange(p1,p2,p3,p4,p5,p6, ncol = 2)
+```
+
+```{r Genes versus UMI Correlations, echo=TRUE, warning=FALSE}
+#Correlation of genes v. UMI
+metadata %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 750) +
+  geom_hline(yintercept = 500) +
+  facet_wrap(~sample)
+```
+
+## Filtering Cells Based on QC
+```{r Filter}
+#Subset high-quality cells on Determined QC metrics from above
+filtered_seurat <- subset(x = merged_seurat, 
+                          subset= (nUMI >= 750) & 
+                            (nGene >= 500) & 
+                            (log10GenesPerUMI > 0.80) & 
+                            (mitoRatio < 0.10))
+
+#Keep genes expressed in 10 or more cells
+counts <- GetAssayData(object = filtered_seurat, slot = "counts")
+nonzero <- counts > 0
+keep_genes <- Matrix::rowSums(nonzero) >= 0
+filtered_counts <- counts[keep_genes, ]
+
+#Create Seurat Object after Filtering Low Quality Cells
+filtered_seurat <- CreateSeuratObject(filtered_counts, meta.data = filtered_seurat@meta.data)
+filtered_seurat
+```
+A total of 83 cells were removed. Our filtered dataset therefore has 7,648 cells with 55,536 unique features.  
+
+## Determining Cell Cycle State
+Cell cycle can be a confounding source of variability within our datasets. Therefore, we scored each cell based on expression of G2M and S phase features following the Cell-Cycle Scoring Vignette in Seurat. 
+
+```{r Cell Cycle, warning=FALSE}
+#Obtain list of mouse cell cycle genes
+cc_file <- getURL("https://raw.githubusercontent.com/hbc/tinyatlas/master/cell_cycle/Mus_musculus.csv") 
+cell_cycle_genes <- read.csv(text = cc_file)
+
+#Determine Cell Cycle Score
+Seurat_CellCycle <- NormalizeData(filtered_seurat)
+Seurat_CellCycle <- CellCycleScoring(Seurat_CellCycle,
+                                     g2m.features = cc.genes$g2m.genes,
+                                     s.features = cc.genes$s.genes
+)
+
+#View(Seurat_CellCycle@meta.data)
+Seurat_CellCycle <- FindVariableFeatures(Seurat_CellCycle, verbose = F)
+Seurat_CellCycle <- ScaleData(Seurat_CellCycle, verbose = F)
+Seurat_CellCycle <- RunPCA(Seurat_CellCycle, verbose = F)
+DimPlot(Seurat_CellCycle, reduction = "pca", group.by = "Phase", split.by = "Phase")
+```
+
+
+As seen in the PCA plot, cell cycle does not appear to be a major source of variation in our dataset overall.
+
+## SCTransform Normalization and Integration of Datasets
+Normalization and variance stabilization of molecular count data was carried out using the R package sctransform (v0.2.1). We did not regress out mitochondrial genes, as this may mask important gene expression changes in efferocytosis. Since our lab has previously shown that macrophage metabolism shifts upon AC engulfment, we predict mitochondrial gene changes within our data.
+
+```{r include=FALSE}
+options(future.globals.maxSize= 993718400)
+```
+
+
+```{r SCTransform, message=FALSE, warning=FALSE}
+#Split merged filtered Seurat into individual Seurat Objects
+split_seurat <- SplitObject(filtered_seurat, split.by = "sample")
+split_seurat <- split_seurat[c("WT_Ctrl", "WT_2_hr", "WT_6_hr", "MerKD_Ctrl", "MerKD_2hr", "MerKD_6_hr")]
+
+#scTransform data without regressing out mitochondrial genes
+for (i in 1:length(split_seurat)) {
+  split_seurat[[i]] <- CellCycleScoring(split_seurat[[i]], g2m.features = cc.genes$g2m.genes, s.features = cc.genes$s.genes)
+  split_seurat[[i]] <- SCTransform(split_seurat[[i]], verbose = F)
+}
+
+```
+
+Integration of the datasets was carried out using IntegrateData function in Seurat. Importantly, the SCT-transformed datasets were prepared for integration using the PrepSCTIntegration function.
+
+```{r Integration, echo=TRUE, warning=FALSE}
+#Prepare and Integrate SCTransformed data into an integrated Seurat Object
+#integ_features <- SelectIntegrationFeatures(object.list = split_seurat, nfeatures = 3000)
+#split_seurat <- PrepSCTIntegration(object.list = split_seurat, anchor.features = integ_features, verbose = F)
+#integ_anchors <- FindIntegrationAnchors(object.list = split_seurat, normalization.method = "SCT", anchor.features = integ_features, verbose = F)
+#Integrated_Seurat <- IntegrateData(anchorset = integ_anchors, normalization.method = "SCT", verbose = F)
+```
+
+```{r include=FALSE}
+Integrated_Seurat <- readRDS("results/Integrated_Seurat.rds")
+```
+
+```{r message=FALSE, warning=FALSE}
+#Run PCA on integrated dataset
+Integrated_Seurat <- RunPCA(object = Integrated_Seurat)
+PCAPlot(Integrated_Seurat, split.by = "sample")
+DimHeatmap(Integrated_Seurat, dims = 1:9, cells = 500, balanced = T)
+print(x = Integrated_Seurat[["pca"]], dims = 1:10, nfeatures = 5)
+ElbowPlot(object = Integrated_Seurat, ndims = 50)
+
+#Run UMAP on integrated dataset
+Integrated_Seurat <- RunUMAP(Integrated_Seurat, dims = 1:40)
+DimPlot(Integrated_Seurat)
+
+```
+
+
+# Cluster Identification and Macrophage Heterogeneity at Steady State
+## Seurat Clustering 
+Clusters were identified using graph-based clustering approach implemented by the FindCluster function in Seurat at various resolutions to determine transcriptionally distinct populations of resident peritoneal cells. Clusters with high cell cycle scores were excluded from further downstream analyses. 
+
+```{r}
+Integrated_Seurat <- FindNeighbors(object = Integrated_Seurat, dims = 1:40, verbose = F)
+Integrated_Seurat <- FindClusters(object = Integrated_Seurat, resolution = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.4), verbose = F)
+
+#Resolution 0.2
+Idents(object = Integrated_Seurat) <- "integrated_snn_res.0.2"
+Integrated_Seurat <- RunUMAP(Integrated_Seurat, reduction = "pca", dims = 1:40, verbose = F)
+p7 <- DimPlot(Integrated_Seurat, reduction = "umap", label = T) +NoLegend()
+
+#Resolution 0.4
+Idents(object = Integrated_Seurat) <- "integrated_snn_res.0.4"
+Integrated_Seurat <- RunUMAP(Integrated_Seurat, reduction = "pca", dims = 1:40, verbose = F)
+p8 <- DimPlot(Integrated_Seurat, reduction = "umap", label = T, label.size = 6) +NoLegend()
+
+
+#Resolution 0.6
+Idents(object = Integrated_Seurat) <- "integrated_snn_res.0.6"
+Integrated_Seurat <- RunUMAP(Integrated_Seurat, reduction = "pca", dims = 1:40, verbose = F)
+p9 <- DimPlot(Integrated_Seurat, reduction = "umap", label = T, label.size = 6)  +NoLegend()
+
+
+#Resolution 0.8
+Idents(object = Integrated_Seurat) <- "integrated_snn_res.0.8"
+Integrated_Seurat <- RunUMAP(Integrated_Seurat, reduction = "pca", dims = 1:40, verbose = F)
+p10 <- DimPlot(Integrated_Seurat, reduction = "umap", label = T, label.size = 6) +NoLegend()
+
+grid.arrange(p7,p8,p9,p10, ncol = 2)
+
+#Revisit QC metrics
+metrics <- c("nUMI", "nGene", "S.Score", "G2M.Score", "mitoRatio")
+FeaturePlot(Integrated_Seurat, reduction = "umap", features = metrics, pt.size = 0.4, sort.cell = T, min.cutoff = "q10", label = T)
+
+```
+
+##SingleR Annotiations
+To unbiasedly identify resident peritoneal cells present in the dataset, SingleR (v1.0.5) was employed. Briefly, SingleR infers the origin of each individual cell by referencing transcriptomic datasets of pure cell types. We utilized the ImmGen database, which contains normalized expression values for immune cells from 830 murine microarrays to ID our peritoneal cell types. 
+
+```{r message=FALSE}
+#Load SingleR Package
+library(SingleR)
+immgen.se <- ImmGenData()
+```
+
+```{r Single R, message=FALSE, warning=FALSE}
+#Label Cells with Main Categories in ImmGen Database
+counts <- GetAssayData(Integrated_Seurat)
+pred.integrated <- SingleR(test = counts, ref = immgen.se, labels = immgen.se$label.main)
+Main.labels <- table(pred.integrated$labels)
+all.markers <- metadata(pred.integrated)$de.genes
+```
+
+```{r message=FALSE, warning=FALSE}
+#Label Seurat object with SingleR annotations
+to.remove <- pruneScores(pred.integrated)
+summary(to.remove)
+
+Integrated_Seurat[["SingleR.labels"]] <- pred.integrated$labels
+DimPlot(Integrated_Seurat, group.by = "SingleR.labels", cols = c("royalblue", "forestgreen", "darkolivegreen3", "deepskyblue3", "gray", "navy", "orchid", "darkorchid4", "firebrick", "goldenrod", "azure4", "black", "darkgoldenrod4", "olivedrab1",  "tan2", "azure3", "forestgreen", "salmon"))
+SingleR_markers <- metadata(pred.integrated)$de.genes
+
+#Create Heatmap based on SingleR classifications
+plotScoreHeatmap(pred.integrated)
+
+```
+
+
+## Macrophage Identification and Subsetting
+### Macrophage Identification
+To confirm the classification of macrophages in our dataset, we determined canonical immunne cell marker expression. 
+```{r Immune Cell Marker Expression}
+#Low resolution
+Idents(object = Integrated_Seurat) <- "integrated_snn_res.0.2"
+DimPlot(Integrated_Seurat, label = F)
+
+DotPlot(Integrated_Seurat, features = c("Itgam", "Adgre1", "Icam2", "Itgax", "H2-Ab1", "Cd19", "Cd79a", "Cr2", "Cd3e", "Cd4", "Cd8a"))
+
+FeaturePlot(Integrated_Seurat, features = c("Itgam", "Adgre1", "Icam2", "Itgax", "H2-Ab1", "Mertk"), order = T)
+```
+> Itgam (Cd11b), Itgax (Cd11c), Adgre1 (F4/80), H2-Ab1 (MHCII)
+
+### Filtering Macrophages
+Next we subsetted Clusters "0" and "3" as these were identified as macrophages and DCs by both SingleR and canonical macrophage marker expression. Additionally, we subset just macrophages in our MerTK +/+ Control condition to uncover peritoneal macrophage heterogenity at steady state.
+```{r Subset Macs and WT Control Macs}
+#Subset macrophages/DCs for all samples
+Integrated_Seurat_MacsDCs <- SubsetData(Integrated_Seurat, ident.use = c("0", "3"))
+
+#Subset Wild Type Macs only
+Idents(Integrated_Seurat_MacsDCs) <- "sample"
+WT_Control <- SubsetData(Integrated_Seurat_MacsDCs, ident.use = "WT_Ctrl")
+Idents(WT_Control) <- "integrated_snn_res.0.4"
+DimPlot(WT_Control, label = T)
+WT_Control_Macs <- SubsetData(WT_Control, ident.use = c("1", "3", "5", "6", "11"))
+```
+
+Note that Cluster "12" was omitted from downstream analyses as this cluster was enriched for cell G2M cell cycle genes compared to other macrophage clusters.
+
+### UMAP Plot of Macrophage Clusters
+```{r include=FALSE}
+WT_Control_vis <- readRDS("results/WT_Control_vis.rds")
+```
+
+```{r DimPlot in Figure 1B}
+#Remove outlier cells for visualization
+#Macsplot <- DimPlot(WT_Control)
+#Macs_selection <- CellSelector(Macsplot)
+#Idents(WT_Control, cells = Macs_selection) <- "Macrophages"
+#WT_Control_vis <- SubsetData(WT_Control, ident.use = "Macrophages")
+
+#Dimplot in Figure 1B
+Idents(object = WT_Control_vis) <- "integrated_snn_res.0.4"
+DimPlot(WT_Control_vis, cols = c("royalblue3", "firebrick", "deepskyblue2", "goldenrod", "darkorchid", "gray"), pt.size = 2)
+```
+
+### Heatmap of Macrophage Clusters
+```{r Heatmap of Macrophage Clusters Figure 1C, message=FALSE, warning=FALSE}
+#Determine Top 50 markers for each macrophage cluster
+DefaultAssay(WT_Control_Macs) <- "RNA"
+WT_Control_Macs  <- NormalizeData(WT_Control_Macs, verbose = F)
+
+WT_Control_Macs_markers <- FindAllMarkers(WT_Control_Macs , only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, test.use = "MAST", verbose = F)
+
+WT_Control_Macs_markers_top50 <- WT_Control_Macs_markers %>% group_by(cluster) %>% top_n(n = 50, wt = avg_logFC)
+head(WT_Control_Macs_markers_top50)
+
+#Heatmap in Figure 1C
+DoHeatmap(WT_Control_Macs, features = WT_Control_Macs_markers_top50$gene, slot = "scale.data", assay = "SCT", group.colors = c("royalblue3", "firebrick", "deepskyblue2", "goldenrod", "darkorchid"),  disp.min = -2) + NoLegend()
+```
+
+### Plotting Features in Macrophage UMAP
+```{r Feature Plot Mac Markers}
+DefaultAssay(WT_Control_vis) <- "RNA"
+FeaturePlot(WT_Control_vis, features = c("Itgam", "Adgre1", "Icam2", "Timd4", "Klf2", "Mertk", "Itgax", "H2-Ab1", "Ccr2"), order = T, pt.size = 2, ncol = 3)
+```
+
+### Plotting Features in Macrophage Violin Plot
+```{r Violin Plot Mac Markers}
+#Subset Macrophages further in WT Steady State Condition
+Idents(WT_Control) <- "integrated_snn_res.0.4"
+WT_Control_Macs <- SubsetData(WT_Control, ident.use = c("1", "3", "5", "6"))
+
+#Cytokine and Marker Gene Expression - VlnPlot in Figure 1E
+DefaultAssay(WT_Control_Macs) <- "SCT"
+VlnPlot.Macs <- VlnPlot(WT_Control_Macs, features = c("Klf2", "Gata6", "Cd93", "Csf1r", "Anxa5", "Cd36", "Actb", "Arg1", "Irf4", "Retnla", "Cd74", "Tgfbi",  "Il1b", "Il6", "Tnf", "Cxcl2"),  cols = c("royalblue3", "firebrick", "deepskyblue2", "goldenrod"), pt.size = 0, combine = F)
+for(i in 1:length(VlnPlot.Macs)) {
+  VlnPlot.Macs[[i]] <- VlnPlot.Macs[[i]] + NoLegend() + theme(axis.title.y = element_blank(), axis.title.x = element_blank(), axis.text.x = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+}
+cowplot::plot_grid(plotlist = VlnPlot.Macs, ncol = 4)
+
+```
+
+
+
+
+
+
+
+
+### Differential Gene Expression Between Clusters
+Differentially expressed genes were determined using the MAST algorithm between Cluster 1 and other macrophage clusters. Once determined, the differnetially expressed genes were submitted to gProfiler for gene ontology.
+
+```{r Cluster Marker Comaprison, message=FALSE}
+#Cluster Comparisons for gProfiler###############################
+Mac1_3 <- FindMarkers(WT_Control_Macs, ident.1 = c("1"), ident.2 = "3", test.use = "MAST", min.pct = 0.25, logfc.threshold = 0.25, verbose = F)
+Mac1_3.Markers <- subset(Mac1_3, Mac1_3$p_val_adj < 0.05)
+head(Mac1_3.Markers)
+
+Mac1_5 <- FindMarkers(WT_Control_Macs, ident.1 = c("1"), ident.2 = "5", test.use = "MAST", min.pct = 0.25, logfc.threshold = 0.25, verbose = F)
+Mac1_5.Markers <- subset(Mac1_5, Mac1_5$p_val_adj < 0.05)
+head(Mac1_5.Markers)
+
+Mac1_6 <- FindMarkers(WT_Control_Macs, ident.1 = "1", ident.2 = "6", test.use = "MAST", min.pct = 0.25, logfc.threshold = 0.25, verbose = F)
+Mac1_6.Markers <- subset(Mac1_6, Mac1_6$p_val_adj < 0.05)
+head(Mac1_6.Markers)
+```
+
+# Efferocytosis Transcriptional Signatures
+Peritoneal macrophages were cultured with apoptotic cells in an ex vivo efferocytosis assay. Apoptotic cells (ACs) were generated using GFP-Jurkat Human T cells (GenTarget) exposed to UV radiation for 7 minutes followed by a 2-hour incubation at 37°C. Apoptosis was confirmed by annexin V positive, propidium iodide negative identification. Adherent resident peritoneal cells were co-cultivated with ACs at a ratio of 5 ACs to 1 peritoneal cell for 2 hours or 6 hours as indicated. Control cells were given a media change corresponding to the 6-hour timepoint. Non-engulfed ACs were removed from the co-culture through rigorous rinsing with warm saline. 
+
+```{r Subset Data for Efferocytosis}
+#Isolate Wild Type Macrophages from all time points
+Idents(Integrated_Seurat) <- "integrated_snn_res.0.4"
+Integrated_Macs <- SubsetData(Integrated_Seurat, ident.use = c("1", "3", "5", "6"))
+```
+```{r include=FALSE}
+Integrated_Macs <- readRDS("results/Integrated_Macs_vis")
+```
+```{r}
+#Remove "outlier" cells
+#Integrated_Macsplot <- DimPlot(Integrated_Macs)
+#Integrated_Macs_selection <- CellSelector(Integrated_Macsplot)
+#Idents(Integrated_Macs, cells = Integrated_Macs_selection) <- "Macrophages"
+#Integrated_Macs <- SubsetData(Integrated_Macs, ident.use = "Macrophages")
+
+Idents(Integrated_Macs) <- "integrated_snn_res.0.4"
+DimPlot(Integrated_Macs)
+
+#Isolate Wild Type F4/80+ Peritoneal Macrophages
+Idents(Integrated_Macs) <- "sample"
+Integrated_Macs_WT <- SubsetData(Integrated_Macs, ident.use = c("WT_Ctrl", "WT_2_hr", "WT_6_hr"))
+
+#Control
+p11 <- DimPlot(Integrated_Macs_WT, group.by = "sample", cols = c("grey", "grey", "blue"), pt.size = 3, order = T)
+
+#6 hour
+p12 <- DimPlot(Integrated_Macs_WT, group.by = "sample", cols = c("grey", "blue", "grey"), pt.size = 3, order = F)
+
+#2 hour
+Integrated_Macs_WT$sample <- factor(Integrated_Macs_WT$sample, levels = c("WT_Ctrl", "WT_6_hr", "WT_2_hr"))
+p13 <- DimPlot(Integrated_Macs_WT, group.by = "sample", cols = c("grey", "grey", "blue"), pt.size = 3, order = T)
+
+grid.arrange(p11, p12, p13, ncol = 1)
+```
+
+## Pseudotime Trajectory Analysis
+With our inference that each cell represented in our analysis was at a unique stage of efferocytosis, we performed a pseudotemporal reconstruction using Slingshot, a tool that infers global lineage structures and pseudotime variables for each cell along a lineage. Two distinct lineages were observed which corresponded to unique transcriptional changes in our F4/80+ LPMs and MHCII+ SPMs. 
+
+### Pseudotime with Slingshot
+```{r Pseudotime, message=FALSE, warning=FALSE}
+#Isolate Macrophage Subpopulations
+Idents(Integrated_Macs_WT) <- "integrated_snn_res.0.4"
+Integrated_Macs_WT_MHCIILO <- SubsetData(Integrated_Macs_WT, ident.use = c("1", "3", "5"))
+Integrated_Macs_WT_MHCIIHI <- SubsetData(Integrated_Macs_WT, ident.use = "6")
+
+#Create single cell experiment objects
+Integrated_Macs_WT_MHCIILO_SCE <- as.SingleCellExperiment(Integrated_Macs_WT_MHCIILO)
+table(Integrated_Macs_WT_MHCIILO_SCE$sample)
+
+Integrated_Macs_WT_MHCIIHI_SCE <- as.SingleCellExperiment(Integrated_Macs_WT_MHCIIHI)
+table(Integrated_Macs_WT_MHCIIHI_SCE$sample)
+
+#Re-order sample levels
+Integrated_Macs_WT_MHCIILO_SCE$sample <- factor(Integrated_Macs_WT_MHCIILO_SCE$sample, levels = c("WT_2_hr", "WT_6_hr", "WT_Ctrl"))
+
+Integrated_Macs_WT_MHCIIHI_SCE$sample <- factor(Integrated_Macs_WT_MHCIIHI_SCE$sample, levels = c("WT_2_hr", "WT_6_hr", "WT_Ctrl"))
+
+#Assign Cluster IDs in SCE object
+Idents(Integrated_Macs_WT_MHCIILO) <- "integrated_snn_res.0.4"
+colData(Integrated_Macs_WT_MHCIILO_SCE)$Seurat_clusters <- as.character(Integrated_Macs_WT_MHCIILO@active.ident)
+
+Idents(Integrated_Macs_WT_MHCIIHI) <- "integrated_snn_res.0.4"
+colData(Integrated_Macs_WT_MHCIIHI_SCE)$Seurat_clusters <- as.character(Integrated_Macs_WT_MHCIIHI@active.ident)
+
+###Run Slingshot Analysis on Different Populations of WT Macs
+#MHCII LO UMAP Trajectory
+Integrated_Macs_WT_MHCIILO_SCE <- slingshot(Integrated_Macs_WT_MHCIILO_SCE, clusterLabels = "Seurat_clusters", reducedDim = "UMAP")
+colors <- rainbow(100, alpha = 1)
+plot(reducedDims(Integrated_Macs_WT_MHCIILO_SCE)$UMAP, col = colors[cut(Integrated_Macs_WT_MHCIILO_SCE$slingPseudotime_1, breaks=100)], pch=16, asp = 1, cex = 0.5, main = "MHCIILO Macrophages")
+lines(SlingshotDataSet(Integrated_Macs_WT_MHCIILO_SCE), lwd=4, col ="black")
+
+#MHCII HI UMAP Trajectory
+Integrated_Macs_WT_MHCIIHI_SCE <- slingshot(Integrated_Macs_WT_MHCIIHI_SCE, clusterLabels = "Seurat_clusters", reducedDim = "UMAP")
+colors <- rainbow(100, alpha = 1)
+plot(reducedDims(Integrated_Macs_WT_MHCIIHI_SCE)$UMAP, col = colors[cut(Integrated_Macs_WT_MHCIIHI_SCE$slingPseudotime_1, breaks=100)], pch=16, asp = 1, cex = 0.5, main = "MHCIIHI Macrophages")
+lines(SlingshotDataSet(Integrated_Macs_WT_MHCIIHI_SCE), lwd=4, col ="black")
+```
+
+
+Next, we ran slingshot with PCA as the method for reduced dimension as UMAP can incorrectly over-reduce dimension potentially obscurring data from pseudotime. 
+
+```{r PCA Pseudotime, message=FALSE}
+#PCA MHCII LO
+Integrated_Macs_WT_MHCIILO_SCE <- slingshot(Integrated_Macs_WT_MHCIILO_SCE, clusterLabels = "Seurat_clusters", reducedDim = "PCA")
+
+colors <- rainbow(100, alpha = 1)
+plot(reducedDims(Integrated_Macs_WT_MHCIILO_SCE)$PCA, col = colors[cut(Integrated_Macs_WT_MHCIILO_SCE$slingPseudotime_1, breaks=100)], pch=16, asp = 1, cex = 0.5, main = "MHCIILO Macrophages")
+lines(SlingshotDataSet(Integrated_Macs_WT_MHCIILO_SCE), lwd=4, col ="black")
+
+ggplot(as.data.frame(colData(Integrated_Macs_WT_MHCIILO_SCE)), aes(x = Integrated_Macs_WT_MHCIILO_SCE$slingPseudotime_1, y = sample, colour = Seurat_clusters)) +  geom_quasirandom(groupOnX = FALSE) +  scale_color_tableau() + theme_classic() +  xlab("Slingshot pseudotime") + ylab("Timepoint") + ggtitle("MHCIILO Macs by Condition")
+
+
+#PCA MHCII HI
+Integrated_Macs_WT_MHCIIHI_SCE <- slingshot(Integrated_Macs_WT_MHCIIHI_SCE, clusterLabels = "Seurat_clusters", reducedDim = "PCA")
+
+colors <- rainbow(100, alpha = 1)
+plot(reducedDims(Integrated_Macs_WT_MHCIIHI_SCE)$PCA, col = colors[cut(Integrated_Macs_WT_MHCIIHI_SCE$slingPseudotime_1, breaks=100)], pch=16, asp = 1, cex = 0.5, main = "MHCIIHI Macrophages")
+lines(SlingshotDataSet(Integrated_Macs_WT_MHCIIHI_SCE), lwd=4, col ="black")
+
+ggplot(as.data.frame(colData(Integrated_Macs_WT_MHCIIHI_SCE)), aes(x = Integrated_Macs_WT_MHCIIHI_SCE$slingPseudotime_1, y = sample, colour = sample)) +  geom_quasirandom(groupOnX = FALSE) +  scale_color_tableau() + theme_classic() +  xlab("Slingshot pseudotime") + ylab("Timepoint") + ggtitle("MHCIIHI Macs by Condition")
+
+```
+
+### Determining Differnetially Expressed Genes After Efferocytosis
+```{r Effero DE Genes, message=FALSE}
+###DE Genes
+#MHCII LO
+DefaultAssay(Integrated_Macs_WT_MHCIILO) <- "RNA"
+Integrated_Macs_WT_MHCIILO <- NormalizeData(Integrated_Macs_WT_MHCIILO)
+Idents(Integrated_Macs_WT_MHCIILO) <- "sample"
+WT_MHCIILO_Markers <- FindMarkers(Integrated_Macs_WT_MHCIILO, ident.1 =  "WT_6_hr", ident.2 = "WT_Ctrl", test.use = "MAST")
+WT_MHCIILO_Markers <- subset(WT_MHCIILO_Markers, WT_MHCIILO_Markers$p_val < 0.05 & abs(WT_MHCIILO_Markers$avg_logFC) > 0.4)
+
+#MHCII HI
+DefaultAssay(Integrated_Macs_WT_MHCIIHI) <- "RNA"
+Integrated_Macs_WT_MHCIIHI <- NormalizeData(Integrated_Macs_WT_MHCIIHI)
+Idents(Integrated_Macs_WT_MHCIIHI) <- "sample"
+WT_MHCIIHI_Markers <- FindMarkers(Integrated_Macs_WT_MHCIIHI, ident.1 =  "WT_6_hr", ident.2 = "WT_Ctrl", test.use = "MAST")
+WT_MHCIIHI_Markers <- subset(WT_MHCIIHI_Markers, WT_MHCIIHI_Markers$p_val < 0.05 & abs(WT_MHCIIHI_Markers$avg_logFC) > 0.4)
+
+#Plot Expression of Interesting DEgenes as a function of pseudotime
+plotExpression(Integrated_Macs_WT_MHCIILO_SCE, features = c("Cd36", "Il1b", "Il6", "Tgfbi", "H2-Ab1", "Il1rn"), x = "slingPseudotime_1", show_smooth = T, point_alpha = 0.4, colour_by = "sample", scales = "free", show_se = F) 
+
+plotExpression(Integrated_Macs_WT_MHCIIHI_SCE, features = c("Cd36", "Il1b", "Il6", "Tgfbi", "H2-Ab1", "Il1rn"), x = "slingPseudotime_1", show_smooth = T, colour_by = "sample", scales = "free", show_se = F) 
+```
+
+### Creating Dataset to import into Phantasus
+```{r CLuster Averages Effero, message=FALSE}
+#MHCII LO
+Idents(Integrated_Macs_WT_MHCIILO) <- "sample"
+cluster.averages <- AverageExpression(Integrated_Macs_WT_MHCIILO)
+write.csv(cluster.averages[["SCT"]], file = "./results/Integrated_Macs_WT_MHCIILO.csv", row.names = TRUE, quote = FALSE)
+
+#MHCII HI
+Idents(Integrated_Macs_WT_MHCIIHI) <- "sample"
+cluster.averages <- AverageExpression(Integrated_Macs_WT_MHCIIHI)
+write.csv(cluster.averages[["SCT"]], file = "./results/Integrated_Macs_WT_MHCIIHI.csv", row.names = TRUE, quote = FALSE)
+```
+
+### Gene Ontolgy using GOPlot
+```{r Gene Ontology MHCII LO}
+#MHCII LO
+## Organize Selected Gene Pathways from gProfiler into a compatible data frame
+WT_MHCII_LO_GO_pathways <- read.csv(file = "./results/gProfiler Results/WT_MHCIILO.csv")
+WT_MHCII_LO_GO_pathways <- as.data.frame(WT_MHCII_LO_GO_pathways)
+
+## Organize Differnetially Expressed genes into compatible data frame
+WT_MHCIILO_Markers_genes <- as.data.frame(WT_MHCIILO_Markers)
+WT_MHCIILO_Markers_genes$ID <- row.names(WT_MHCIILO_Markers_genes)
+names(WT_MHCIILO_Markers_genes)[1] <- "P.Value"
+names(WT_MHCIILO_Markers_genes)[2] <- "logFC"
+names(WT_MHCIILO_Markers_genes)[5] <- "adj.P.Val"
+head(WT_MHCIILO_Markers_genes)
+
+##Combine datasets above to form an object for GOPlot
+WT_MHCII_LO_circ <- circle_dat(WT_MHCII_LO_GO_pathways, WT_MHCIILO_Markers_genes)
+
+##Create a Bubble Plot
+GOBubble(WT_MHCII_LO_circ, ID = F, table.legend = F, colour = c("gray25", "gray25"), labels = 2)
+```
+
+```{r Gene Ontology MHCII HI}
+#MHCII HI
+## Organize Selected Gene Pathways from gProfiler into a compatible data frame
+WT_MHCII_HI_GO_pathways <- read.csv(file = "./results/gProfiler Results/WT_MHCIIHI.csv")
+WT_MHCII_HI_GO_pathways <- as.data.frame(WT_MHCII_HI_GO_pathways)
+
+## Organize Differnetially Expressed genes into compatible data frame
+WT_MHCIIHI_Markers_genes <- as.data.frame(WT_MHCIIHI_Markers)
+WT_MHCIIHI_Markers_genes$ID <- row.names(WT_MHCIIHI_Markers_genes)
+names(WT_MHCIIHI_Markers_genes)[1] <- "P.Value"
+names(WT_MHCIIHI_Markers_genes)[2] <- "logFC"
+names(WT_MHCIIHI_Markers_genes)[5] <- "adj.P.Val"
+head(WT_MHCIIHI_Markers_genes)
+
+##Combine datasets above to form an object for GOPlot
+WT_MHCII_HI_circ <- circle_dat(WT_MHCII_HI_GO_pathways, WT_MHCIIHI_Markers_genes)
+
+##Create a Bubble Plot
+GOBubble(WT_MHCII_HI_circ, ID = F, table.legend = F, colour = c("goldenrod", "goldenrod"), labels = 2)
+```
+
+
+# MerTK KO Steady State
+To validate our approach, we incorporated a well characterized efferocytosis receptor knockout, Mertk-/-. We performed the same experimental design as above.
+
+## Determine Differences at Steady State between MerTK +/+ and MerTK -/- Macs
+```{r Subset MerTK KO Macs, message=FALSE}
+#Isolate MerTK -/- (MerKD) Macrophages
+Idents(Integrated_Macs) <- "sample"
+Integrated_Macrophages_MerKD <- SubsetData(Integrated_Macs, ident.use = c("MerKD_Ctrl", "MerKD_2hr", "MerKD_6_hr"))
+
+#Isolate Steady State Macs of MerTK +/+ and MerTK -/- 
+Integrated_Macrophages_Control <- SubsetData(Integrated_Macs, ident.use = c("WT_Ctrl", "MerKD_Ctrl"))
+
+#UMAP Plot at Steady State
+Idents(Integrated_Macrophages_Control) <- "integrated_snn_res.0.4"
+DimPlot(Integrated_Macrophages_Control, split.by = "sample", cols = c("royalblue3", "firebrick", "deepskyblue2", "goldenrod", "darkorchid"))
+```
+
+### Differential Gene Expression in MerTK -/- Macs
+```{r DE Genes MerTK KO Macs, message=FALSE}
+DefaultAssay(Integrated_Macrophages_Control) <- "RNA"
+Integrated_Macrophages_Control  <- NormalizeData(Integrated_Macrophages_Control)
+Idents(Integrated_Macrophages_Control) <- "sample"
+Control_Markers <- FindMarkers(Integrated_Macrophages_Control, ident.1 = "WT_Ctrl", ident.2 = "MerKD_Ctrl", test.use = "MAST")
+Control_Markers_pos <- subset(Control_Markers, Control_Markers$p_val_adj < 0.05 & Control_Markers$avg_logFC > 0)
+Control_Markers_neg <- subset(Control_Markers, Control_Markers$p_val_adj < 0.05 & Control_Markers$avg_logFC < 0)
+head(Control_Markers_pos, n = 10)
+head(Control_Markers_neg, n =10)
+```
+
+### Determine how MerTK KO affects specific Macrophage Subsets
+Since MerTK is predominately expressed on F4/80+ MHCII Lo Macrophages, we determined how MerTK KO affected expression of cytokines and other macrophage markers at steady state.
+
+```{r Group Macs Together}
+Idents(Integrated_Macrophages_Control) <- "integrated_snn_res.0.4"
+Integrated_Macrophages_Control_Subset <- SubsetData(Integrated_Macrophages_Control, ident.use = c("1", "3", "5", "6"))
+
+#Rename cluster IDs to represent either F4/80+ or MHCII HI
+Integrated_Macrophages_Control_Subset <- RenameIdents(Integrated_Macrophages_Control_Subset, "1" =  "F4/80+", "3" = "F4/80+", "5" = "F4/80+", "6" = "MHCII+")
+Integrated_Macrophages_Control_Subset$sample <- factor(Integrated_Macrophages_Control_Subset$sample, levels = c("WT_Ctrl", "MerKD_Ctrl"))
+
+#Plot changes in Selected Genes
+VlnPlot.Macs <- VlnPlot(Integrated_Macrophages_Control_Subset, features = c("Il1b", "Tgfbi", "Axl", "H2-Ab1", "Cd74", "Cd36"), pt.size = 0, cols = c("firebrick", "grey"), combine = F, split.by = "sample", sort = "decreasing")
+for(i in 1:length(VlnPlot.Macs)) {
+  VlnPlot.Macs[[i]] <- VlnPlot.Macs[[i]] + NoLegend()+ theme(axis.title.y = element_blank(), axis.title.x = element_blank(), axis.text.x = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+}
+cowplot::plot_grid(plotlist = VlnPlot.Macs, ncol = 3)
+
+#Feature Plot of Mac Markers in Figure 1 in MerTK KO
+Idents(Integrated_Macrophages_Control) <- "sample"
+Integrated_Macrophages_Control_MerKD <- SubsetData(Integrated_Macrophages_Control, ident.use = c("MerKD_Ctrl"))
+FeaturePlot(Integrated_Macrophages_Control_MerKD, features = c("Itgam", "Adgre1", "Icam2", "Itgax", "H2-Ab1", "Ccr2", "Timd4", "Klf2", "Mertk"), order = T, pt.size = 1.5, ncol = 3)
+```
+
+## Efferocytosis in MerTK -/-
+### Experimental Time Points
+```{r Effero Time Points}
+Idents(Integrated_Macrophages_MerKD) <- "sample"
+#6 Hour 
+Integrated_Macrophages_MerKD$sample <- factor(Integrated_Macrophages_MerKD$sample, levels = c("MerKD_Ctrl", "MerKD_2hr", "MerKD_6_hr"))
+DimPlot(Integrated_Macrophages_MerKD, group.by = "sample", cols = c("grey", "grey", "firebrick3"), pt.size = 3, order = T)
+#2 Hour
+Integrated_Macrophages_MerKD$sample <- factor(Integrated_Macrophages_MerKD$sample, levels = c("MerKD_Ctrl", "MerKD_6_hr", "MerKD_2hr"))
+DimPlot(Integrated_Macrophages_MerKD, group.by = "sample", cols = c("grey", "grey", "firebrick3"), pt.size = 3, order = T)
+#Control
+Integrated_Macrophages_MerKD$sample <- factor(Integrated_Macrophages_MerKD$sample, levels = c("MerKD_2hr", "MerKD_6_hr", "MerKD_Ctrl"))
+DimPlot(Integrated_Macrophages_MerKD, group.by = "sample", cols = c("grey", "grey", "firebrick3"), pt.size = 3, order = T)
+```
+The F4/80+ macrophages appear to be significantly altered after challenge with ACs. There we looked at this population further to determine how Mertk KO altered the transcriptional program of this macrophage subset during efferocytosis.
+
+### Slingshot Trajectory Analyses
+```{r}
+#Subset F4/80+ Macs
+Idents(Integrated_Macrophages_MerKD) <- "integrated_snn_res.0.4"
+Integrated_Macrophages_MerKD_F480 <- SubsetData(Integrated_Macrophages_MerKD, ident.use = c("1", "3", "5"))
+
+#Create single cell experiment object
+Integrated_Macrophages_MerKD_F480_SCE <- as.SingleCellExperiment(Integrated_Macrophages_MerKD_F480)
+table(Integrated_Macrophages_MerKD_F480_SCE$sample)
+
+#Re-order sample levels
+Integrated_Macrophages_MerKD_F480_SCE$sample <- factor(Integrated_Macrophages_MerKD_F480_SCE$sample, levels = c("MerKD_6_hr", "MerKD_2hr", "MerKD_Ctrl"))
+
+#Assign Cluster IDs in SCE object
+Idents(Integrated_Macrophages_MerKD_F480) <- "integrated_snn_res.0.4"
+colData(Integrated_Macrophages_MerKD_F480_SCE)$Seurat_clusters <- as.character(Integrated_Macrophages_MerKD_F480@active.ident)
+
+###Run Slingshot Analysis
+#UMAP
+Integrated_Macrophages_MerKD_F480_SCE <- slingshot(Integrated_Macrophages_MerKD_F480_SCE, clusterLabels = "Seurat_clusters", reducedDim = "UMAP")
+
+colors <- rainbow(100, alpha = 1)
+plot(reducedDims(Integrated_Macrophages_MerKD_F480_SCE)$UMAP, col = colors[cut(Integrated_Macrophages_MerKD_F480_SCE$slingPseudotime_1, breaks=100)], pch=16, asp = 1, cex = 0.5, main = "F480 Macrophages")
+lines(SlingshotDataSet(Integrated_Macrophages_MerKD_F480_SCE), lwd=4, col ="black", type = "lineages")
+
+#PCA
+Integrated_Macrophages_MerKD_F480_SCE <- slingshot(Integrated_Macrophages_MerKD_F480_SCE, clusterLabels = "Seurat_clusters", reducedDim = "PCA", start.clus = "1")
+
+colors <- rainbow(50, alpha = 1)
+plot(reducedDims(Integrated_Macrophages_MerKD_F480_SCE)$PCA, col = colors[cut(Integrated_Macrophages_MerKD_F480_SCE$slingPseudotime_1,breaks=50)], pch=16, asp = 1)
+lines(SlingshotDataSet(Integrated_Macrophages_MerKD_F480_SCE), lwd=4, col ="black", type ="lineages")
+
+#Pseudotime as a function of Cluster
+ggplot(as.data.frame(colData(Integrated_Macrophages_MerKD_F480_SCE)), aes(x = Integrated_Macrophages_MerKD_F480_SCE$slingPseudotime_1, y = sample, colour = Seurat_clusters)) +  geom_quasirandom(groupOnX = FALSE) +  scale_color_tableau() + theme_classic() +  xlab("Slingshot pseudotime") + ylab("Timepoint") + ggtitle("F480 Macs by Condition") 
+```
+
+### Differential Gene Expression & Gene Ontology
+```{r}
+#DE Genes before and after 6 hour of Effero
+DefaultAssay(Integrated_Macrophages_MerKD_F480) <- "RNA"
+Integrated_Macrophages_MerKD_F480 <- NormalizeData(Integrated_Macrophages_MerKD_F480)
+
+Idents(Integrated_Macrophages_MerKD_F480) <- "sample"
+MerKD_F480_Markers <- FindMarkers(Integrated_Macrophages_MerKD_F480, ident.2 =  "MerKD_Ctrl", ident.1 =  "MerKD_6_hr", test.use = "MAST", only.pos = T)
+MerKD_F480_Markers <- subset(MerKD_F480_Markers, MerKD_F480_Markers$p_val_adj < 0.05)
+head(MerKD_F480_Markers, n = 10)
+
+#WT MHCII LO
+DefaultAssay(Integrated_Macs_WT_MHCIILO) <- "RNA"
+Integrated_Macs_WT_MHCIILO <- NormalizeData(Integrated_Macs_WT_MHCIILO)
+
+Idents(Integrated_Macs_WT_MHCIILO) <- "sample"
+WT_MHCIILO_Markers <- FindMarkers(Integrated_Macs_WT_MHCIILO, ident.2 =  "WT_Ctrl", ident.1 = "WT_6_hr", test.use = "MAST", only.pos = T)
+WT_MHCIILO_Markers <- subset(WT_MHCIILO_Markers, WT_MHCIILO_Markers$p_val < 0.05)
+head(WT_MHCIILO_Markers)
+
+#F480 Mac Comparison between genotypes
+F480_Same_DEgenes <- intersect(row.names(MerKD_F480_Markers), row.names(WT_MHCIILO_Markers))
+F480_Control_unique <- setdiff(row.names(WT_MHCIILO_Markers), row.names(MerKD_F480_Markers))
+F480_Knockout_unique <- setdiff(row.names(MerKD_F480_Markers), row.names(WT_MHCIILO_Markers))
+```
+
+Gene Profiling was carried out on genes that were uniquely upregulated by each genotype along with genes that were upregulated by both genotypes.
+
+```{r GO Plots MerTK KO}
+#gProfiler Results
+MHCIILO_Common_GO <- read.csv(file = "./results/gProfiler Results/MHCIILO_Common.csv")
+MHCIILO_Common_GO <- as.data.frame(MHCIILO_Common_GO)
+MerKD_MHCIILO_Unique_GO <- read.csv(file = "./results/gProfiler Results/MerKD_MHCIILO_Unique.csv")
+MerKD_MHCIILO_Unique_GO <- as.data.frame(MerKD_MHCIILO_Unique_GO)
+WT_MHCIILO_Unique_GO <- read.csv(file = "./results/gProfiler Results/WT_MHCIILO_Unique.csv")
+WT_MHCIILO_Unique_GO <- as.data.frame(WT_MHCIILO_Unique_GO)
+
+
+MerKD_F480_Markers_genes <- as.data.frame(MerKD_F480_Markers)
+MerKD_F480_Markers_genes$ID <- row.names(MerKD_F480_Markers_genes)
+names(MerKD_F480_Markers_genes)[1] <- "P.Value"
+names(MerKD_F480_Markers_genes)[2] <- "logFC"
+names(MerKD_F480_Markers_genes)[5] <- "adj.P.Val"
+head(MerKD_F480_Markers_genes)
+
+WT_MHCIILO_Markers_genes <- as.data.frame(WT_MHCIILO_Markers)
+WT_MHCIILO_Markers_genes$ID <- row.names(WT_MHCIILO_Markers_genes)
+names(WT_MHCIILO_Markers_genes)[1] <- "P.Value"
+names(WT_MHCIILO_Markers_genes)[2] <- "logFC"
+names(WT_MHCIILO_Markers_genes)[5] <- "adj.P.Val"
+head(WT_MHCIILO_Markers_genes)
+
+#Common
+MHCIILO_Common_GO_circle <- circle_dat(MHCIILO_Common_GO, WT_MHCIILO_Markers_genes)
+GOBubble(MHCIILO_Common_GO_circle , ID = F, table.legend = F, colour = c("gray40", "gray40"), labels = 0)
+
+#MerKD Unique
+MerKD_MHCIILO_Unique_GO_circle <- circle_dat(MerKD_MHCIILO_Unique_GO, MerKD_F480_Markers_genes)
+GOBubble(MerKD_MHCIILO_Unique_GO_circle , ID = F, table.legend = F, colour = c("firebrick", "firebrick"), labels = 1)
+
+#WT Unique
+WT_MHCIILO_Unique_GO_circle <- circle_dat(WT_MHCIILO_Unique_GO, WT_MHCIILO_Markers_genes)
+GOBubble(WT_MHCIILO_Unique_GO_circle , ID = F, table.legend = F, colour = c("gray25", "gray25"), labels = 0)
+```
